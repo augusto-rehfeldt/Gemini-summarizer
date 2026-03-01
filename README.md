@@ -162,4 +162,4 @@ jobs:
 
 ## License
 
-MIT
+Apache
