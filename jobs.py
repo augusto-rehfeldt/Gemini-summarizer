@@ -10,6 +10,7 @@ import json
 import subprocess
 import time
 import re
+import socket
 from urllib import request as urlrequest
 from urllib import error as urlerror
 
@@ -37,8 +38,10 @@ class SummarizerWorker(QThread):
     """Worker thread that calls Gemini API for each book."""
     MAX_GEMINI_RETRIES = 3
     DEFAULT_RETRY_DELAY_SECONDS = 5.0
+    REQUEST_TIMEOUT_SECONDS = 180
     DEFAULT_MAX_BOOK_WORDS = 500_000
     EXTRACTION_CHAR_BUDGET = 2_000_000
+    RETRYABLE_HTTP_CODES = {408, 429, 500, 502, 503, 504}
 
     progress   = pyqtSignal(int, str)   # (current_index, message)
     book_done  = pyqtSignal(int, str)   # (book_id, summary_text)
@@ -71,7 +74,9 @@ class SummarizerWorker(QThread):
                     title   = mi.title or 'Unknown Title'
                     authors = ', '.join(mi.authors) if mi.authors else 'Unknown Author'
 
-                    self.progress.emit(idx, f'[{idx+1}/{total}] Extracting text: {title}')
+                    self.progress.emit(idx, '')
+                    self.progress.emit(idx, f'[{idx+1}/{total}] {title}')
+                    self.progress.emit(idx, '  Stage: Extracting text')
                     content, details = self._extract_book_text(
                         book_id,
                         title,
@@ -79,46 +84,46 @@ class SummarizerWorker(QThread):
                         char_budget=self.EXTRACTION_CHAR_BUDGET,
                     )
                     available_formats = details.get('formats') or []
-                    self.progress.emit(idx, f'  - Available formats: {", ".join(available_formats) if available_formats else "none"}')
-                    self.progress.emit(idx, f'  - Chosen format: {details.get("chosen_fmt") or "unknown"}')
+                    self.progress.emit(idx, f'    - Available formats: {", ".join(available_formats) if available_formats else "none"}')
+                    self.progress.emit(idx, f'    - Chosen format: {details.get("chosen_fmt") or "unknown"}')
                     if details.get('path'):
-                        self.progress.emit(idx, f'  - Source path: {details["path"]}')
+                        self.progress.emit(idx, f'    - Source path: {details["path"]}')
                     if details.get('extractor'):
-                        self.progress.emit(idx, f'  - Extractor: {details["extractor"]}')
+                        self.progress.emit(idx, f'    - Extractor: {details["extractor"]}')
 
                     if not content:
                         if details.get('error'):
-                            self.progress.emit(idx, f'  - Extraction detail: {details["error"]}')
+                            self.progress.emit(idx, f'    - Extraction detail: {details["error"]}')
                         self.book_error.emit(book_id, 'Could not extract text from book (no supported format found).')
                         continue
                     self.progress.emit(
                         idx,
-                        f'  - Extracted text: {details.get("word_count", 0)} words, {len(content)} chars'
+                        f'    - Extracted text: {details.get("word_count", 0)} words, {len(content)} chars'
                     )
                     if details.get('truncated'):
                         self.progress.emit(
                             idx,
-                            f'  - Extraction was truncated at {details.get("max_words", self.max_input_words)} words'
+                            f'    - Extraction was truncated at {details.get("max_words", self.max_input_words)} words'
                         )
 
-                    self.progress.emit(idx, f'[{idx+1}/{total}] Calling Gemini API: {title}')
+                    self.progress.emit(idx, '  Stage: Calling Gemini API')
                     prompt = self.prompt_template.format(
                         title=title,
                         authors=authors,
                         text=content,
                         max_words=self.max_words
                     )
-                    self.progress.emit(idx, f'  - Model: {self.model}')
+                    self.progress.emit(idx, f'    - Model: {self.model}')
                     self.progress.emit(
                         idx,
-                        f'  - Prompt size: {len(prompt.split())} words, {len(prompt)} chars'
+                        f'    - Prompt size: {len(prompt.split())} words, {len(prompt)} chars'
                     )
 
                     summary, api_meta = self._call_gemini_with_retries(prompt, idx)
-                    self.progress.emit(idx, f'  - API candidates: {api_meta.get("candidates", 0)}')
+                    self.progress.emit(idx, f'    - API candidates: {api_meta.get("candidates", 0)}')
                     if api_meta.get('finish_reason'):
-                        self.progress.emit(idx, f'  - Finish reason: {api_meta["finish_reason"]}')
-                    self.progress.emit(idx, f'  - Summary characters: {len(summary)}')
+                        self.progress.emit(idx, f'    - Finish reason: {api_meta["finish_reason"]}')
+                    self.progress.emit(idx, f'    - Summary characters: {len(summary)}')
                     if not summary:
                         raise ValueError('Gemini returned an empty response.')
                     self.book_done.emit(book_id, summary)
@@ -139,18 +144,21 @@ class SummarizerWorker(QThread):
         while True:
             try:
                 if attempt > 1:
-                    self.progress.emit(idx, f'  - Gemini retry attempt {attempt}/{total_attempts}')
+                    self.progress.emit(idx, f'    - Retry attempt: {attempt}/{total_attempts}')
                 return self._call_gemini(prompt)
             except RetryableGeminiError as e:
                 if attempt > self.MAX_GEMINI_RETRIES:
                     raise RuntimeError(
-                        f'Gemini HTTP 429 persisted after {self.MAX_GEMINI_RETRIES} retries: {e}'
+                        f'Gemini request still failing after {self.MAX_GEMINI_RETRIES} retries: {e}'
                     )
 
-                wait_seconds = (e.retry_after_seconds or self.DEFAULT_RETRY_DELAY_SECONDS) + 1.0
+                wait_seconds = e.retry_after_seconds
+                if wait_seconds is None:
+                    wait_seconds = self.DEFAULT_RETRY_DELAY_SECONDS * attempt
+                wait_seconds = max(1.0, float(wait_seconds))
                 self.progress.emit(
                     idx,
-                    f'  - Rate limit hit (429). Waiting {wait_seconds:.1f}s before retry {attempt + 1}/{total_attempts}.'
+                    f'    - Retryable error: {e}. Waiting {wait_seconds:.1f}s before retry {attempt + 1}/{total_attempts}.'
                 )
                 if not self._sleep_with_cancel(wait_seconds):
                     raise RuntimeError('Cancelled while waiting to retry Gemini request.')
@@ -180,6 +188,20 @@ class SummarizerWorker(QThread):
                     return None
         return None
 
+    def _parse_retry_after_header_seconds(self, headers):
+        if not headers:
+            return None
+        retry_after = headers.get('Retry-After')
+        if not retry_after:
+            return None
+        retry_after = str(retry_after).strip()
+        if retry_after.isdigit():
+            try:
+                return float(retry_after)
+            except Exception:
+                return None
+        return None
+
     def _call_gemini(self, prompt):
         """Call Gemini REST API without external SDK dependencies."""
         safe_endpoint = (
@@ -201,22 +223,36 @@ class SummarizerWorker(QThread):
             method='POST',
         )
         try:
-            with urlrequest.urlopen(req, timeout=120) as resp:
+            with urlrequest.urlopen(req, timeout=self.REQUEST_TIMEOUT_SECONDS) as resp:
                 raw = resp.read().decode('utf-8', errors='replace')
         except urlerror.HTTPError as e:
             body = e.read().decode('utf-8', errors='replace')
-            if e.code == 429:
-                retry_after = None
+            if e.code in self.RETRYABLE_HTTP_CODES:
+                retry_after = self._parse_retry_after_header_seconds(getattr(e, 'headers', None))
+                parsed = None
                 try:
                     parsed = json.loads(body)
-                    retry_after = self._parse_retry_delay_seconds(parsed.get('error') or {})
                 except Exception:
-                    pass
+                    parsed = None
+                if retry_after is None and parsed:
+                    retry_after = self._parse_retry_delay_seconds(parsed.get('error') or {})
                 raise RetryableGeminiError(
-                    f'Gemini HTTP 429 on {safe_endpoint}: {body}',
+                    f'Gemini HTTP {e.code}',
                     retry_after_seconds=retry_after,
                 )
             raise RuntimeError(f'Gemini HTTP {e.code} on {safe_endpoint}: {body}')
+        except (TimeoutError, socket.timeout) as e:
+            raise RetryableGeminiError(
+                f'Gemini request timed out after {self.REQUEST_TIMEOUT_SECONDS}s: {e}'
+            )
+        except urlerror.URLError as e:
+            reason = str(getattr(e, 'reason', e))
+            timeout_like = 'timed out' in reason.lower() or isinstance(getattr(e, 'reason', None), socket.timeout)
+            if timeout_like:
+                raise RetryableGeminiError(
+                    f'Gemini network timeout: {reason}'
+                )
+            raise RuntimeError(f'Gemini request failed on {safe_endpoint}: {reason}')
         except Exception as e:
             raise RuntimeError(f'Gemini request failed on {safe_endpoint}: {e}')
 
@@ -524,7 +560,8 @@ class SummarizeJob(QDialog):
         self.worker.start()
 
     def _on_progress(self, idx, msg):
-        self.status_label.setText(msg)
+        if msg and msg.strip():
+            self.status_label.setText(msg)
         self.progress_bar.setValue(idx)
         self._log(msg)
 
